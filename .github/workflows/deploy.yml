@@ -1,0 +1,80 @@
+# Déploiement automatique : chaque push sur main est envoyé sur l'hébergement Hostinger de territoriamutuelle.com (rsync via SSH).
+#
+# Secrets nécessaires (Settings → Secrets and variables → Actions) :
+# SSH_HOST         adresse IP du serveur (hPanel → Avancé → Accès SSH)
+# SSH_PORT         port SSH (65002 chez Hostinger)
+# SSH_USER         identifiant SSH (u387676715)
+# SSH_PRIVATE_KEY  clé privée dont la clé publique est ajoutée dans hPanel → Accès SSH
+# SSH_KNOWN_HOSTS  sortie de « ssh-keyscan -p 65002 IP »
+# REMOTE_PATH      dossier du site : domains/territoriamutuelle.com/public_html
+# Sans ces secrets, le workflow s'arrête sans rien envoyer.
+
+name: Déploiement
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Mise en ligne sur Hostinger
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+    steps:
+      - name: Secrets configurés ?
+        id: check
+        run: |
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ] || [ -z "$SSH_PRIVATE_KEY" ] || [ -z "$REMOTE_PATH" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Déploiement désactivé::Secrets absents, rien n'a été envoyé. Voir l'en-tête de ce fichier."
+            exit 0
+          fi
+          if [ -z "$SSH_KNOWN_HOSTS" ]; then
+            echo "::error title=SSH_KNOWN_HOSTS manquant::Obligatoire pour vérifier l'identité du serveur. Rien n'a été envoyé."
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.enabled == 'true'
+        with:
+          persist-credentials: false
+
+      - name: Préparer la connexion SSH
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+
+      # Pas de --delete : un fichier présent uniquement sur le serveur n'est jamais supprimé.
+      # Exclus : fichiers de travail (mémos .md).
+      - name: Envoyer les fichiers
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          rsync -rlvz --checksum \
+            --exclude='.git/' --exclude='.github/' --exclude='*.md' \
+            -e "ssh -p ${SSH_PORT:-65002} -i ~/.ssh/deploy_key -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes" \
+            ./ "$SSH_USER@$SSH_HOST:$REMOTE_PATH/"
+
+      - name: Vérifier le site
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          sleep 5
+          code=$(curl -s -o /dev/null -w '%{http_code}' https://territoriamutuelle.com/)
+          echo "Page d'accueil : HTTP $code"
+          [ "$code" = "200" ]
